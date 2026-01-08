@@ -1,0 +1,247 @@
+#include <EEPROM.h>
+#include "GravityTDS.h"
+
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <ScioSense_ENS16x.h>
+#include <BH1750.h>
+
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+
+// Sensor Pin Definitions
+#define TURBIDITY_SENSOR_PIN A0  // Analog pin A0 for turbidity
+#define TDS_SENSOR_PIN A1       // Analog pin A1 for TDS sensor
+
+
+// ENS160 CO2 sensor
+#define ENS160_I2C_ADDRESS 0x52
+#define INTN 2
+ENS160 ens16x;
+
+
+// BH1750 light sensor
+BH1750 lightMeter;
+
+
+// Data wire is plugged into digital pin 22 on the Arduino
+#define ONE_WIRE_BUS 22
+
+
+// Setup a oneWire instance to communicate with any OneWire device
+OneWire oneWire(ONE_WIRE_BUS);  
+ 
+// Pass oneWire reference to DallasTemperature library
+DallasTemperature sensors(&oneWire);
+
+
+// Objects
+GravityTDS gravityTds;
+
+
+// Variables
+float temperature = 25;  // Default temperature for TDS compensation
+float tdsValue = 0;
+int turbidityValue = 0;
+uint16_t CO2Value = 0;   // eCO2 in ppm
+float lightValue = 0;
+float temptValue = 0;   // DS18B20 temperature reading
+
+
+// Timing
+unsigned long previousMillis = 0;
+const long interval = 1000; // Update every second
+
+
+void setup() {
+  // Initialize serial communication with computer
+  Serial.begin(9600);
+ 
+  // Initialize Serial1 for communication with ESP32 (TX1=18, RX1=19 on Mega)
+  Serial1.begin(9600);  // Use 9600 baud for reliable communication
+ 
+  // --- Initialize I2C bus ---
+  Wire.begin();   // Mega SDA=20, SCL=21
+
+
+  sensors.begin();  // Start up the library
+
+
+  pinMode(LED_BUILTIN, OUTPUT);
+
+
+  // Initialize TDS sensor
+  gravityTds.setPin(TDS_SENSOR_PIN);
+  gravityTds.setAref(5.0);  // reference voltage on ADC
+  gravityTds.setAdcRange(1024);  // 1024 for 10-bit ADC
+  gravityTds.begin();
+
+
+  // --- ENS160 setup ---
+  ens16x.enableDebugging(Serial);
+  ens16x.begin(&Wire, ENS160_I2C_ADDRESS);
+
+
+  ens16x.startStandardMeasure();
+
+
+#ifdef USE_INTERRUPT
+  ens16x.setInterruptPin(INTN);
+  ens16x.writeConfiguration(
+        ENS16X_CONFIGURATION_INTERRUPT_ENABLE
+      | ENS16X_CONFIGURATION_NEW_GENERAL_PURPOSE_DATA
+      | ENS16X_CONFIGURATION_NEW_DATA
+  );
+#endif
+
+
+  // --- BH1750 setup ---
+  lightMeter.begin();
+
+
+  // --- notes for pins configurations---
+  Serial.println("Pin Configuration:");
+  Serial.println("Turbidity: Pin A0");
+  Serial.println("TDS: Pin A1");
+  Serial.println("CO2: I2C");
+  Serial.println("Tempt: GPIO3");
+  Serial.println("Light: I2C");
+
+
+  Serial.println("----------------------------------------");
+}
+
+
+void loop() {
+  unsigned long currentMillis = millis();
+  delay (10000);
+ 
+  // Read sensors every interval
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+   
+    // Read both sensors
+    readTurbidity();
+    readTDS();
+    readCO2();
+    readlight();
+    readtempt();
+
+
+    // Print sensor data to Serial Monitor
+    printSensorData();
+   
+    // Send sensor data to ESP32
+    sendDataToESP32();
+  }
+
+
+
+
+  // Read from esp32
+  if (Serial1.available()) {
+    String command = Serial1.readStringUntil('\n');
+    command.trim();   // Remove whitespace/newline
+
+
+
+
+    Serial.print("Received: ");
+    Serial.println(command);
+
+
+
+
+    if (command == "ON") {
+      digitalWrite(LED_BUILTIN, HIGH);
+      Serial.println("LED turned ON");
+    } else if (command == "OFF") {
+      digitalWrite(LED_BUILTIN, LOW);
+      Serial.println("LED turned OFF");
+    }
+  }
+}
+
+
+void readTurbidity() {
+  turbidityValue = analogRead(TURBIDITY_SENSOR_PIN);
+}
+
+
+void readTDS() {
+  gravityTds.setTemperature(temperature);
+  gravityTds.update();
+  tdsValue = gravityTds.getTdsValue();
+}
+
+
+void readCO2() {
+  // --- ENS160 readings ---
+  ens16x.wait();
+  if (ens16x.update() == RESULT_OK) {
+    if (ens16x.hasNewData()) {
+      CO2Value=ens16x.getEco2();
+    }
+  }
+}
+
+
+void readlight() {
+  // --- BH1750 readings ---
+  lightValue = lightMeter.readLightLevel();
+}
+
+
+void readtempt() {
+  sensors.requestTemperatures();
+  temptValue = sensors.getTempCByIndex(0);
+}
+
+
+void printSensorData() {
+  Serial.println("=== SENSOR READINGS ===");
+ 
+  // Turbidity
+  Serial.print("Turbidity: ");
+  Serial.println(turbidityValue);
+ 
+  // TDS
+  Serial.print("TDS: ");
+  Serial.print(tdsValue, 0);
+  Serial.println(" ppm");
+
+
+  // CO2
+  Serial.print("CO2: ");
+  Serial.println(CO2Value);
+ 
+  // Temperature
+  Serial.print("Temperature: ");
+  Serial.println(temptValue);
+
+
+  // Light 
+  Serial.print("Light: ");
+  Serial.println(lightValue);
+  Serial.println("----------------------------------------");
+}
+
+
+
+
+void sendDataToESP32() {
+  // Create a data string in format: "TURBIDITY:value,TDS:value"
+  String dataString = "TURBIDITY:" + String(turbidityValue) + ",TDS:" + String(tdsValue, 0)+ ",CO2:" + String(CO2Value) + ",TEMPT:" + String(temptValue) +",LIGHT:" + String(lightValue) + '\n' ;
+ 
+  // Send to ESP32 via Serial1
+  Serial1.println(dataString);
+ 
+  // Optional: Print what's being sent for debugging
+  Serial.print("Sent to ESP32: ");
+  Serial.println(dataString);
+}
+
+
